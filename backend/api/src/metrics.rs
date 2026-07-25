@@ -349,6 +349,23 @@ pub static PUBLISHERS_TOTAL: Lazy<IntGauge> =
 pub static PUBLISHER_REGISTRATIONS: Lazy<IntCounter> =
     counter!("publisher_registrations_total", "Publisher registrations");
 
+// ── Trusted-client bypass (issue #1054) ─────────────────────────────────────
+/// Total number of requests that bypassed rate limiting via a trusted-client
+/// token or whitelisted IP.  Labelled by `identity_type` ("ip" or "api_key")
+/// so dashboards can distinguish the two bypass paths.
+pub static RATE_LIMIT_BYPASS_TOTAL: Lazy<IntCounterVec> = counter_vec!(
+    "rate_limit_bypass_total",
+    "Requests that bypassed rate limiting via a trusted-client token or whitelisted IP",
+    &["identity_type"]
+);
+
+/// Rolling 1-minute bypass count, used by the spike-detection logic.
+/// Stored as a gauge so it can be reset at the start of each minute window.
+pub static RATE_LIMIT_BYPASS_PER_MINUTE: Lazy<IntGauge> = gauge!(
+    "rate_limit_bypass_requests_per_minute",
+    "Trusted-client bypass requests in the last sliding minute (spike detection)"
+);
+
 pub fn register_all(r: &Registry) -> prometheus::Result<()> {
     r.register(Box::new(HTTP_REQUESTS_TOTAL.clone()))?;
     r.register(Box::new(HTTP_REQUEST_DURATION.clone()))?;
@@ -433,6 +450,8 @@ pub fn register_all(r: &Registry) -> prometheus::Result<()> {
     r.register(Box::new(PATCHES_FAILED.clone()))?;
     r.register(Box::new(PUBLISHERS_TOTAL.clone()))?;
     r.register(Box::new(PUBLISHER_REGISTRATIONS.clone()))?;
+    r.register(Box::new(RATE_LIMIT_BYPASS_TOTAL.clone()))?;
+    r.register(Box::new(RATE_LIMIT_BYPASS_PER_MINUTE.clone()))?;
     r.register(Box::new(JOB_QUEUE_DEPTH.clone()))?;
     r.register(Box::new(JOB_PROCESSING_DURATION.clone()))?;
     r.register(Box::new(JOB_FAILURES_TOTAL.clone()))?;

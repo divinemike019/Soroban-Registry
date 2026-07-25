@@ -34,6 +34,29 @@
 //! (`/metrics`), and internal admin flows (`/api/admin/*`) bypass the rate
 //! limiter so monitoring systems and operators are never blocked.
 //!
+//! ## Trusted-client bypass audit (issue #1054)
+//!
+//! When a request is allowed through via a whitelisted IP or trusted API key,
+//! [`log_bypass`] emits a structured `tracing` event at `WARN` level so the
+//! event appears in every log aggregator (ELK, Loki, CloudWatch, etc.) and is
+//! easy to query with `event.type = "trusted_bypass"`.
+//!
+//! Fields emitted per bypass event:
+//! - `event` – always `"trusted_bypass"`
+//! - `identity_type` – `"ip"` or `"api_key"`
+//! - `client_identity` – the (possibly masked) IP or API-key prefix
+//! - `client_ip` – raw client IP
+//! - `path` – request path
+//! - `method` – HTTP method
+//! - `timestamp` – RFC-3339 UTC string
+//!
+//! In addition, two Prometheus counters are updated:
+//! - `rate_limit_bypass_total{identity_type}` – lifetime total
+//! - `rate_limit_bypass_requests_per_minute` – rolling 1-minute gauge
+//!
+//! If bypass volume exceeds [`BYPASS_SPIKE_THRESHOLD`] in a one-minute window,
+//! a `Critical` alert is dispatched through [`crate::alerting::AlertManager`].
+//!
 //! ## Horizontal scaling note
 //!
 //! This rate limiter is **per-instance**.  When running multiple API replicas
@@ -45,6 +68,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
     net::{IpAddr, SocketAddr},
+    sync::atomic::{AtomicI64, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -58,9 +82,14 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use chrono::Utc;
 use tokio::sync::Mutex;
 
-use crate::error::ApiError;
+use crate::{
+    alerting::{Alert, AlertManager, AlertSeverity},
+    error::ApiError,
+    metrics::{RATE_LIMIT_BYPASS_PER_MINUTE, RATE_LIMIT_BYPASS_TOTAL},
+};
 
 // Issue #891: 1,000 requests per minute per IP/API key by default.
 const DEFAULT_ANON_LIMIT: u32 = 1_000;
@@ -84,6 +113,12 @@ const BURST_WINDOW_SECONDS: u64 = 60; // 1 minute burst window
 
 /// How often the background task sweeps for expired buckets.
 const EVICTION_INTERVAL: Duration = Duration::from_secs(5 * 60); // every 5 minutes
+
+/// How many bypass events per minute before we fire a spike alert (issue #1054).
+const BYPASS_SPIKE_THRESHOLD: u64 = 100;
+
+/// How long to remember the bypass-spike window start (seconds).
+const BYPASS_WINDOW_SECS: u64 = 60;
 
 const HEADER_RATE_LIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
 const HEADER_RATE_LIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
@@ -126,11 +161,72 @@ fn is_exempt_path(path: &str) -> bool {
     path.starts_with("/health") || path == "/metrics" || path.starts_with("/api/admin/")
 }
 
+/// Identifies which bypass mechanism was used for a single request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassKind {
+    /// The client's IP address is in `RATE_LIMIT_TRUSTED_IPS`.
+    TrustedIp,
+    /// The client's API key is in `RATE_LIMIT_TRUSTED_API_KEYS`.
+    TrustedApiKey,
+}
+
+impl BypassKind {
+    fn as_identity_type(self) -> &'static str {
+        match self {
+            BypassKind::TrustedIp => "ip",
+            BypassKind::TrustedApiKey => "api_key",
+        }
+    }
+}
+
+/// Minimal in-process state for the rolling bypass spike window (issue #1054).
+///
+/// Uses atomic integers so it can be cheaply shared without a Mutex:
+/// - `window_start_unix` – Unix-second timestamp of the current window start.
+/// - `window_count` – bypass events recorded so far in that window.
+struct BypassSpikeState {
+    window_start_unix: AtomicI64,
+    window_count: AtomicU64,
+}
+
+impl BypassSpikeState {
+    fn new() -> Self {
+        Self {
+            window_start_unix: AtomicI64::new(Utc::now().timestamp()),
+            window_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one bypass event and return the running count within the current
+    /// 1-minute window.  Resets the window automatically when it expires.
+    fn record_and_count(&self) -> u64 {
+        let now_secs = Utc::now().timestamp();
+        let window_start = self.window_start_unix.load(Ordering::Relaxed);
+
+        if now_secs - window_start >= BYPASS_WINDOW_SECS as i64 {
+            // Start a fresh window.  Use a compare-exchange so only one thread
+            // resets the counter even when requests arrive concurrently.
+            if self
+                .window_start_unix
+                .compare_exchange(window_start, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.window_count.store(1, Ordering::Relaxed);
+                return 1;
+            }
+        }
+
+        self.window_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
 #[derive(Clone)]
 pub struct RateLimitState {
     config: std::sync::Arc<RateLimitConfig>,
     /// Shared bucket map — protected by a *tokio* Mutex so it is async-safe.
     buckets: std::sync::Arc<Mutex<HashMap<BucketKey, BucketState>>>,
+    /// Bypass spike detection window (issue #1054).
+    bypass_spike: std::sync::Arc<BypassSpikeState>,
 }
 
 /// Snapshot of quota usage for a client key (used by the /api/quota endpoint).
@@ -154,6 +250,7 @@ impl RateLimitState {
         Self {
             config: std::sync::Arc::new(config),
             buckets: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            bypass_spike: std::sync::Arc::new(BypassSpikeState::new()),
         }
     }
 
@@ -337,6 +434,89 @@ impl RateLimitState {
         }
     }
 
+    /// Record and audit a trusted-client bypass event (issue #1054).
+    ///
+    /// This method:
+    /// 1. Emits a structured `tracing::warn!` log entry with all identifying
+    ///    fields (identity type, masked identity, raw IP, path, method,
+    ///    timestamp) so that SIEM / log-aggregation tools can index and alert
+    ///    on it.
+    /// 2. Increments the Prometheus counter for the correct identity type.
+    /// 3. Updates the rolling per-minute gauge used by dashboards.
+    /// 4. If the per-minute count exceeds [`BYPASS_SPIKE_THRESHOLD`], dispatches
+    ///    a `Critical` alert via [`AlertManager`] (Slack + PagerDuty if
+    ///    configured).
+    pub async fn audit_bypass<B>(&self, request: &Request<B>, kind: BypassKind) {
+        let client_ip = extract_client_ip(request);
+        let path = request.uri().path().to_owned();
+        let method = request.method().as_str().to_owned();
+        let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let identity_type = kind.as_identity_type();
+
+        // Build a stable, privacy-safe identity string:
+        //  - for IP bypasses: the IP itself (already in logs)
+        //  - for API-key bypasses: first 8 chars of the key + "…" so the key
+        //    can be identified without leaking the full secret.
+        let client_identity = match kind {
+            BypassKind::TrustedIp => client_ip.clone(),
+            BypassKind::TrustedApiKey => extract_auth_token(request)
+                .map(|token| {
+                    let stripped = token
+                        .strip_prefix("Bearer ")
+                        .or_else(|| token.strip_prefix("ApiKey "))
+                        .unwrap_or(&token)
+                        .trim()
+                        .to_string();
+                    if stripped.len() > 8 {
+                        format!("{}…", &stripped[..8])
+                    } else {
+                        stripped
+                    }
+                })
+                .unwrap_or_else(|| "<unknown>".to_string()),
+        };
+
+        // 1. Structured audit log — queryable in any log aggregator.
+        tracing::warn!(
+            event = "trusted_bypass",
+            identity_type,
+            client_identity = %client_identity,
+            client_ip = %client_ip,
+            path = %path,
+            method = %method,
+            timestamp = %timestamp,
+            "Rate-limit bypass: trusted-client token used"
+        );
+
+        // 2. Prometheus counters.
+        RATE_LIMIT_BYPASS_TOTAL
+            .with_label_values(&[identity_type])
+            .inc();
+
+        // 3. Rolling 1-minute gauge + spike detection.
+        let count = self.bypass_spike.record_and_count();
+        RATE_LIMIT_BYPASS_PER_MINUTE.set(count as i64);
+
+        if count == BYPASS_SPIKE_THRESHOLD {
+            // Fire exactly once at the threshold boundary to avoid alert flood.
+            let alert_mgr = AlertManager::new();
+            alert_mgr
+                .dispatch_alert(Alert {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    source: "rate_limit_bypass".to_string(),
+                    message: format!(
+                        "Trusted-client bypass spike: {} bypasses in the last 60 seconds \
+                         (threshold: {}). Review RATE_LIMIT_TRUSTED_IPS / \
+                         RATE_LIMIT_TRUSTED_API_KEYS for leaked or abused tokens.",
+                        count, BYPASS_SPIKE_THRESHOLD
+                    ),
+                    severity: AlertSeverity::Critical,
+                    timestamp: Utc::now(),
+                })
+                .await;
+        }
+    }
+
     /// Derive the bucket key and API tier from an incoming request.
     ///
     /// Tier is resolved in order:
@@ -490,6 +670,11 @@ impl RateLimitConfig {
             write_anonymous_limit: anonymous_limit / 10,
             write_auth_limit: auth_limit / 3,
             window,
+            enterprise_limit: 100_000,
+            burst_window: Duration::from_secs(BURST_WINDOW_SECONDS),
+            per_api_key_limits: HashMap::new(),
+            trusted_client_ips: HashSet::new(),
+            trusted_api_keys: HashSet::new(),
         }
     }
 
@@ -545,22 +730,30 @@ impl RateLimitConfig {
     }
 
     fn is_whitelisted<B>(&self, request: &Request<B>) -> bool {
+        self.bypass_kind(request).is_some()
+    }
+
+    /// Returns the bypass kind if this request is from a trusted client, or
+    /// `None` if normal rate limiting should apply.
+    fn bypass_kind<B>(&self, request: &Request<B>) -> Option<BypassKind> {
         let client_ip = extract_client_ip(request);
         if self.trusted_client_ips.contains(&client_ip) {
-            return true;
+            return Some(BypassKind::TrustedIp);
         }
 
-        extract_auth_token(request)
-            .map(|token| {
-                let normalized = token
-                    .strip_prefix("Bearer ")
-                    .or_else(|| token.strip_prefix("ApiKey "))
-                    .unwrap_or(&token)
-                    .trim()
-                    .to_string();
-                self.trusted_api_keys.contains(&normalized)
-            })
-            .unwrap_or(false)
+        extract_auth_token(request).and_then(|token| {
+            let normalized = token
+                .strip_prefix("Bearer ")
+                .or_else(|| token.strip_prefix("ApiKey "))
+                .unwrap_or(&token)
+                .trim()
+                .to_string();
+            if self.trusted_api_keys.contains(&normalized) {
+                Some(BypassKind::TrustedApiKey)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -587,7 +780,10 @@ pub async fn rate_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if rate_limiter.config.is_whitelisted(&request) {
+    // Issue #1054: trusted-client bypass — audit every bypassed request before
+    // forwarding it, so the bypass is fully visible in logs and metrics.
+    if let Some(bypass_kind) = rate_limiter.config.bypass_kind(&request) {
+        rate_limiter.audit_bypass(&request, bypass_kind).await;
         return next.run(request).await;
     }
 
@@ -880,7 +1076,7 @@ mod tests {
     use axum::{
         http::{Request, StatusCode},
         middleware,
-        routing::get,
+        routing::{get, post},
         Router,
     };
     use tower::Service;
@@ -1446,5 +1642,271 @@ mod tests {
         assert!(!is_exempt_path("/api/contracts"));
         assert!(!is_exempt_path("/api/contracts/verify"));
         assert!(!is_exempt_path("/api/publishers"));
+    }
+
+    // ── Trusted-client bypass audit tests (issue #1054) ──────────────────────
+
+    /// Build a test app where a specific IP is whitelisted (tight read limit of
+    /// 1 so any second request from a non-trusted IP would be blocked).
+    fn test_app_with_trusted_ip(trusted_ip: &str) -> Router<()> {
+        let mut trusted_ips = HashSet::new();
+        trusted_ips.insert(trusted_ip.to_string());
+
+        let config = RateLimitConfig {
+            anonymous_limit: 1,
+            auth_limit: 1,
+            write_anonymous_limit: 1,
+            write_auth_limit: 1,
+            window: Duration::from_secs(60),
+            enterprise_limit: 100_000,
+            burst_window: Duration::from_secs(BURST_WINDOW_SECONDS),
+            per_api_key_limits: HashMap::new(),
+            trusted_client_ips: trusted_ips,
+            trusted_api_keys: HashSet::new(),
+        };
+        let limiter = RateLimitState::new(config);
+
+        Router::new()
+            .route("/read", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                limiter,
+                rate_limit_middleware,
+            ))
+    }
+
+    /// Build a test app where a specific API key is whitelisted.
+    fn test_app_with_trusted_api_key(trusted_key: &str) -> Router<()> {
+        let mut trusted_keys = HashSet::new();
+        trusted_keys.insert(trusted_key.to_string());
+
+        let config = RateLimitConfig {
+            anonymous_limit: 1,
+            auth_limit: 1,
+            write_anonymous_limit: 1,
+            write_auth_limit: 1,
+            window: Duration::from_secs(60),
+            enterprise_limit: 100_000,
+            burst_window: Duration::from_secs(BURST_WINDOW_SECONDS),
+            per_api_key_limits: HashMap::new(),
+            trusted_client_ips: HashSet::new(),
+            trusted_api_keys: trusted_keys,
+        };
+        let limiter = RateLimitState::new(config);
+
+        Router::new()
+            .route("/read", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                limiter,
+                rate_limit_middleware,
+            ))
+    }
+
+    /// A trusted IP must never receive a 429, even after exceeding the normal
+    /// per-IP limit.  The bypass path must be taken for every request.
+    #[tokio::test]
+    async fn trusted_ip_is_never_rate_limited() {
+        let trusted_ip = "10.0.0.1";
+        let app = test_app_with_trusted_ip(trusted_ip);
+
+        // With a limit of 1, the second request from a non-trusted IP would
+        // normally be blocked.  A trusted IP must always pass through.
+        for i in 0..10 {
+            let response = call(
+                &app,
+                Request::builder()
+                    .uri("/read")
+                    .method("GET")
+                    .header("x-forwarded-for", trusted_ip)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_ne!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "trusted IP should never be rate limited (request {i})"
+            );
+        }
+    }
+
+    /// A trusted API key must never receive a 429, even beyond the normal
+    /// per-key limit.
+    #[tokio::test]
+    async fn trusted_api_key_is_never_rate_limited() {
+        let trusted_key = "trusted-secret-key-abc";
+        let app = test_app_with_trusted_api_key(trusted_key);
+
+        for i in 0..10 {
+            let response = call(
+                &app,
+                Request::builder()
+                    .uri("/read")
+                    .method("GET")
+                    .header("x-api-key", trusted_key)
+                    .header("x-forwarded-for", "192.0.2.99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_ne!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "trusted API key should never be rate limited (request {i})"
+            );
+        }
+    }
+
+    /// An untrusted IP still gets rate-limited even when a trusted IP is
+    /// configured — the whitelist must not accidentally open for everyone.
+    #[tokio::test]
+    async fn untrusted_ip_is_still_rate_limited_when_trusted_ip_exists() {
+        let trusted_ip = "10.0.0.1";
+        let untrusted_ip = "1.2.3.4";
+        let app = test_app_with_trusted_ip(trusted_ip);
+
+        // First request from untrusted IP is fine.
+        let first = call(
+            &app,
+            Request::builder()
+                .uri("/read")
+                .method("GET")
+                .header("x-forwarded-for", untrusted_ip)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Second request from same untrusted IP must be blocked (limit=1).
+        let second = call(
+            &app,
+            Request::builder()
+                .uri("/read")
+                .method("GET")
+                .header("x-forwarded-for", untrusted_ip)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "untrusted IP should still be rate limited"
+        );
+    }
+
+    /// `bypass_kind` must identify a trusted IP as `BypassKind::TrustedIp`.
+    #[test]
+    fn bypass_kind_returns_trusted_ip_for_whitelisted_ip() {
+        let mut trusted_ips = HashSet::new();
+        trusted_ips.insert("10.1.2.3".to_string());
+        let config = RateLimitConfig {
+            anonymous_limit: 100,
+            auth_limit: 100,
+            write_anonymous_limit: 10,
+            write_auth_limit: 30,
+            window: Duration::from_secs(60),
+            enterprise_limit: 100_000,
+            burst_window: Duration::from_secs(BURST_WINDOW_SECONDS),
+            per_api_key_limits: HashMap::new(),
+            trusted_client_ips: trusted_ips,
+            trusted_api_keys: HashSet::new(),
+        };
+
+        let req = Request::builder()
+            .uri("/read")
+            .method("GET")
+            .header("x-forwarded-for", "10.1.2.3")
+            .body(Body::empty())
+            .unwrap();
+
+        assert_eq!(config.bypass_kind(&req), Some(BypassKind::TrustedIp));
+    }
+
+    /// `bypass_kind` must identify a trusted API key as `BypassKind::TrustedApiKey`.
+    #[test]
+    fn bypass_kind_returns_trusted_api_key_for_whitelisted_key() {
+        let mut trusted_keys = HashSet::new();
+        trusted_keys.insert("my-secret-key".to_string());
+        let config = RateLimitConfig {
+            anonymous_limit: 100,
+            auth_limit: 100,
+            write_anonymous_limit: 10,
+            write_auth_limit: 30,
+            window: Duration::from_secs(60),
+            enterprise_limit: 100_000,
+            burst_window: Duration::from_secs(BURST_WINDOW_SECONDS),
+            per_api_key_limits: HashMap::new(),
+            trusted_client_ips: HashSet::new(),
+            trusted_api_keys: trusted_keys,
+        };
+
+        let req = Request::builder()
+            .uri("/read")
+            .method("GET")
+            .header("x-api-key", "my-secret-key")
+            .header("x-forwarded-for", "192.0.2.1")
+            .body(Body::empty())
+            .unwrap();
+
+        assert_eq!(config.bypass_kind(&req), Some(BypassKind::TrustedApiKey));
+    }
+
+    /// `bypass_kind` returns `None` for an unknown IP/key.
+    #[test]
+    fn bypass_kind_returns_none_for_unknown_client() {
+        let config = RateLimitConfig {
+            anonymous_limit: 100,
+            auth_limit: 100,
+            write_anonymous_limit: 10,
+            write_auth_limit: 30,
+            window: Duration::from_secs(60),
+            enterprise_limit: 100_000,
+            burst_window: Duration::from_secs(BURST_WINDOW_SECONDS),
+            per_api_key_limits: HashMap::new(),
+            trusted_client_ips: HashSet::new(),
+            trusted_api_keys: HashSet::new(),
+        };
+
+        let req = Request::builder()
+            .uri("/read")
+            .method("GET")
+            .header("x-forwarded-for", "203.0.113.42")
+            .body(Body::empty())
+            .unwrap();
+
+        assert_eq!(config.bypass_kind(&req), None);
+    }
+
+    /// The rolling spike window resets after the time window expires and the
+    /// count restarts from 1.
+    #[test]
+    fn bypass_spike_window_resets_after_expiry() {
+        // Use a very short window via the internal state directly.
+        let state = BypassSpikeState {
+            window_start_unix: AtomicI64::new(Utc::now().timestamp() - BYPASS_WINDOW_SECS as i64 - 1),
+            window_count: AtomicU64::new(50),
+        };
+
+        // The window is expired, so the next record should restart at 1.
+        let count = state.record_and_count();
+        assert_eq!(count, 1, "window should have reset; count should be 1");
+    }
+
+    /// The rolling spike window increments correctly within a fresh window.
+    #[test]
+    fn bypass_spike_window_increments_within_window() {
+        let state = BypassSpikeState::new();
+        assert_eq!(state.record_and_count(), 1);
+        assert_eq!(state.record_and_count(), 2);
+        assert_eq!(state.record_and_count(), 3);
+    }
+
+    /// `BypassKind::as_identity_type` returns the correct label strings used
+    /// in Prometheus metrics.
+    #[test]
+    fn bypass_kind_identity_type_labels() {
+        assert_eq!(BypassKind::TrustedIp.as_identity_type(), "ip");
+        assert_eq!(BypassKind::TrustedApiKey.as_identity_type(), "api_key");
     }
 }
